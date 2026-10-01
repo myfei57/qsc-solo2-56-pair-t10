@@ -1,0 +1,29 @@
+[project]
+name = "psdline"
+version = "1.0.0"
+description = "station sequencing and interlock utility"
+requires-python = ">=3.11"
+dependencies = []
+
+[tool.pytest.ini_options]
+pythonpath = ["."]
+testpaths = ["tests"]
+addopts = "-q"
+
+[tool.setuptools]
+packages = [
+    "psdline",
+    "psdline.ns",
+    "psdline.store",
+    "psdline.station",
+    "psdline.train",
+    "psdline.psd",
+    "psdline.sig",
+    "psdline.interlock",
+    "psdline.door",
+    "psdline.platform",
+    "psdline.gap",
+    "psdline.quota",
+    "psdline.audit",
+    "psdline.console",
+]

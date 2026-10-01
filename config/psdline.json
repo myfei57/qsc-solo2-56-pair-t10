@@ -1,0 +1,54 @@
+{
+  "platform": {
+    "name": "psdline",
+    "unit": "line1",
+    "storage_root": "var/state"
+  },
+  "namespace": {
+    "line": "L1",
+    "stations": ["ST1", "ST2", "ST3"]
+  },
+  "station": {
+    "groups_per_station": 4,
+    "doors_per_group": 6,
+    "group_span_m": 24.0,
+    "stop_tolerance_m": 0.8
+  },
+  "train": {
+    "length_m": 118.0,
+    "max_position_m": 240.0,
+    "dwell_default_s": 45.0,
+    "dwell_max_s": 600.0
+  },
+  "door": {
+    "batch_limit": 64,
+    "open_hold_s": 30.0,
+    "close_confirm_s": 6.0,
+    "lockout_release_s": 12.0
+  },
+  "gap": {
+    "confirm_s": 4.0,
+    "probe_timeout_s": 20.0,
+    "min_clearance_mm": 12.0
+  },
+  "signal": {
+    "refresh_period_s": 1.0,
+    "stale_after_s": 8.0,
+    "sequence_modulus": 65536
+  },
+  "interlock": {
+    "hold_after_fault_s": 3.0,
+    "max_locked_ratio": 0.5
+  },
+  "quota": {
+    "arrival_limit": 1000,
+    "depart_limit": 1000
+  },
+  "audit": {
+    "journal_segment": 512
+  },
+  "console": {
+    "host": "127.0.0.1",
+    "port": 8080
+  }
+}

@@ -1,0 +1,6 @@
+# 运行期直接依赖：无。作业顺序与联锁控制服务只用 Python 标准库
+# （http.server / json / threading / dataclasses / argparse），因此构建期与
+# 运行期都不需要联网安装第三方包。
+
+# 开发／验证依赖：仅测试与交付门禁使用，不进入生产运行期。
+pytest>=9.0
