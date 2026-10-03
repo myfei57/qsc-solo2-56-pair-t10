@@ -19,6 +19,7 @@ packages = [
     "psdline.train",
     "psdline.psd",
     "psdline.sig",
+    "psdline.link",
     "psdline.interlock",
     "psdline.door",
     "psdline.platform",

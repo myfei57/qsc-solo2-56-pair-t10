@@ -85,6 +85,19 @@ class Api:
         add("POST", "/api/clear-fault", self._clear_fault)
         add("POST", "/api/arm", self._arm)
         add("POST", "/api/position", self._position)
+        add("GET", "/api/link", self._link_all)
+        add("GET", "/api/link/{trainID}", self._link_view)
+        add("POST", "/api/link/sample", self._link_sample)
+        add("POST", "/api/link/tick", self._link_tick)
+        add("POST", "/api/link/redrive", self._link_redrive)
+        add("POST", "/api/link/release", self._link_release)
+        add("POST", "/api/link/confirm", self._link_confirm)
+        add("POST", "/api/link/emergency", self._link_emergency)
+        add("POST", "/api/link/close", self._link_close)
+        add("GET", "/api/link/replay/{trainID}", self._link_replay)
+        add("GET", "/api/link/as-of/{trainID}/{eventSeq}", self._link_as_of)
+        add("GET", "/api/link/explain/{eventSeq}", self._link_explain)
+        add("GET", "/api/link/verify", self._link_verify)
         add("POST", "/api/sequence", self._sequence)
         add("POST", "/api/cycle", self._cycle)
         add("POST", "/api/sweep", self._sweep)
@@ -235,6 +248,76 @@ class Api:
         return self._platform.refresh_position(
             _require(body, "train_id"), _as_int(body, "position_m", 0)
         )
+
+    # ---- 车地无线链路 -------------------------------------------------
+
+    def _link_all(self, params: dict, body: dict) -> dict:
+        return {"trains": self._platform.links.views()}
+
+    def _link_view(self, params: dict, body: dict) -> dict:
+        train_id = str(params.get("trainID", ""))
+        if not self._platform.links.is_adopted(train_id):
+            raise RailError(f"列车未纳入链路管控: {train_id}", component="console")
+        return {"train_id": train_id, "view": self._platform.link_view(train_id)}
+
+    def _link_sample(self, params: dict, body: dict) -> dict:
+        train_id = _require(body, "train_id")
+        return self._platform.link_sample(
+            train_id,
+            seq=_as_int(body, "seq", 0),
+            epoch=_require(body, "epoch"),
+            rssi_dbm=_as_float(body, "rssi_dbm", -55.0),
+            snr_db=_as_float(body, "snr_db", 25.0),
+            rtt_ms=_as_float(body, "rtt_ms", 100.0),
+            packet_loss=_as_float(body, "packet_loss", 0.01),
+            position_m=None if body.get("position_m") is None else _as_int(body, "position_m", 0),
+            sent_at=None if body.get("sent_at") is None else _as_float(body, "sent_at", 0.0),
+        )
+
+    def _link_tick(self, params: dict, body: dict) -> dict:
+        return self._platform.link_tick(str(body.get("train_id", "")) or None)
+
+    def _link_redrive(self, params: dict, body: dict) -> dict:
+        return self._platform.link_redrive()
+
+    def _link_release(self, params: dict, body: dict) -> dict:
+        return self._platform.link_release(
+            _require(body, "train_id"), _require(body, "station_id")
+        )
+
+    def _link_confirm(self, params: dict, body: dict) -> dict:
+        return self._platform.confirm_departure(
+            _require(body, "train_id"),
+            _require(body, "request_id"),
+            _require(body, "operator"),
+        )
+
+    def _link_emergency(self, params: dict, body: dict) -> dict:
+        return self._platform.emergency_departure(
+            _require(body, "train_id"),
+            _require(body, "station_id"),
+            _require(body, "supervisor"),
+            _require(body, "reason"),
+        )
+
+    def _link_close(self, params: dict, body: dict) -> dict:
+        return self._platform.close_link_release(
+            _require(body, "train_id"), _require(body, "request_id")
+        )
+
+    def _link_replay(self, params: dict, body: dict) -> dict:
+        return self._platform.link_replay(str(params.get("trainID", "")))
+
+    def _link_as_of(self, params: dict, body: dict) -> dict:
+        return self._platform.link_state_as_of(
+            str(params.get("trainID", "")), int(params.get("eventSeq", 0))
+        )
+
+    def _link_explain(self, params: dict, body: dict) -> dict:
+        return self._platform.link_explain(int(params.get("eventSeq", 0)))
+
+    def _link_verify(self, params: dict, body: dict) -> dict:
+        return self._platform.link_verify()
 
     def _sequence(self, params: dict, body: dict) -> dict:
         return self._platform.sequence_verdict(

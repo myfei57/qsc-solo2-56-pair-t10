@@ -160,6 +160,84 @@ def _next_station(platform: Platform, station_id: str) -> str:
     return stations[(index + 1) % len(stations)]
 
 
+def _cmd_link_demo(args: argparse.Namespace) -> int:
+    """车地无线链路质量端到端演练（可推进时钟，无需真实等待）。"""
+
+    clock = ManualClock()
+    storage_root = getattr(args, "storage_root", None) or tempfile.mkdtemp(prefix="psdline-link-")
+    platform = build_platform(default_config(), clock=clock, storage_root=storage_root)
+    platform.start()
+
+    def feed(seq, epoch="e1", **kwargs):
+        clock.advance(1.0)
+        return platform.link_sample(args.train, seq, epoch, **kwargs)
+
+    log: list[dict] = []
+
+    def note(stage: str, payload: dict) -> None:
+        log.append({"t": clock.now(), "stage": stage, **payload})
+
+    # 1) 上线：连续好采样，位置采信，自动放行。
+    for i in range(1, 4):
+        feed(i, position_m=100 + i)
+    platform.arrive(args.train, args.station, 0)
+    platform.check_gap(args.train)
+    note("online_departure", {"ok": platform.depart(args.train, args.station)["ok"]})
+
+    # 2) 链路劣化但未断（高丢包、弱信号）：位置被扣留、可信度下降。
+    feed(4, rssi_dbm=-88.0, snr_db=6.0, rtt_ms=700.0, packet_loss=0.18, position_m=500)
+    note("poor_link", platform.link_view(args.train))
+
+    # 3) 彻底中断数秒：进入降级，开门默认锁闭，发车须人工确认。
+    clock.advance(5.0)
+    platform.link_tick()
+    pending = platform.link_release(args.train, args.station)
+    note("degraded_release", {"decision": pending["decision"], "rule": pending["rule"]})
+    note("doors_before_confirm",
+         {"allowed": platform.links.can_open_doors(args.train, clock.now())[0]})
+    note("manual_confirm",
+         platform.confirm_departure(args.train, pending["request_id"], "值班员张三"))
+    note("doors_after_confirm",
+         {"allowed": platform.links.can_open_doors(args.train, clock.now())[0]})
+
+    # 4) 长时间彻底失联：禁止发车，仅紧急覆盖可旁路。
+    clock.advance(25.0)
+    platform.link_tick()
+    lost = platform.link_view(args.train)
+    note("lost", {"contact": lost["contact"], "confidence": lost["confidence"],
+                  "backoff_level": lost["backoff_level"]})
+    note("emergency_override", platform.emergency_departure(
+        args.train, args.station, "行车调度李四", "区间故障需立即组织疏散"))
+
+    # 5) 重连：新代次，连续好采样后可信度恢复，位置重新采信。
+    for i in range(1, 4):
+        feed(i, epoch="e2", position_m=700 + i)
+    note("recovered", platform.link_view(args.train))
+
+    # 6) 重放与不可变校验：解释最后一次判定当时凭什么这么判。
+    decisions = [e for e in platform.link_log.all() if e.kind == "release_decided"]
+    last_decision = decisions[-1]
+    explanation = platform.link_explain(last_decision.seq)
+    _dump({
+        "storage_root": storage_root,
+        "timeline": log,
+        "link_events": len(platform.link_log),
+        "last_decision": {
+            "event_seq": explanation["event_seq"],
+            "decision": explanation["decision"],
+            "rule": explanation["rule"],
+            "policy_version": explanation["policy_version"],
+            "confidence": explanation["evidence"]["confidence"],
+            "recent_samples": explanation["recent_samples"],
+        },
+        "chain_verify": platform.link_verify(),
+        "audit_kinds": sorted(
+            {entry.kind for entry in platform.audit.list() if entry.kind.startswith("link")}
+        ),
+    })
+    return 0
+
+
 def _cmd_status(args: argparse.Namespace) -> int:
     platform = _build(args)
     payload = platform.status()
@@ -210,6 +288,11 @@ def build_parser() -> argparse.ArgumentParser:
 
     status = sub.add_parser("status", help="打印状态快照", parents=[common])
     status.set_defaults(func=_cmd_status)
+
+    link_demo = sub.add_parser("link-demo", help="演练车地无线链路降级/失联/重连全链", parents=[common])
+    link_demo.add_argument("--train", default="T01", help="演练用列车标识")
+    link_demo.add_argument("--station", default="ST1", help="演练用站台标识")
+    link_demo.set_defaults(func=_cmd_link_demo)
 
     config = sub.add_parser("config", help="打印生效配置", parents=[common])
     config.set_defaults(func=_cmd_config)

@@ -42,6 +42,21 @@ from .interlock import (
     restore_lockouts,
     verdict_of,
 )
+from .link import (
+    AUTO,
+    BLOCKED,
+    MANUAL,
+    EffectOutbox,
+    LinkEventLog,
+    LinkSample,
+    LinkService,
+    RecordingSink,
+    ReplayCursor,
+    explain_decision,
+    replay_train,
+    state_as_of,
+    verify_chain,
+)
 from .ns import Namespace, NamespaceRegistry
 from .platform import MappingRegistry, adjacent, group_keys, physical_groups, resolve
 from .psd import LockoutRegistry, PSD, PSDRegistry, sweep_station
@@ -100,6 +115,24 @@ class Platform:
             self.bus,
             JsonlJournal(store.root, "audit", segment_limit=self.config.audit.journal_segment),
         )
+        # 链路事件独立成一条只追加的哈希链（link-*.jsonl），与审计流水互不覆盖。
+        self.link_journal = JsonlJournal(
+            store.root, "link", segment_limit=self.config.link.journal_segment
+        )
+        self.link_log = LinkEventLog(self.link_journal)
+        self.link_sink = RecordingSink()
+        self.link_outbox = EffectOutbox(self.link_log)
+        for kind in (
+            "doors_arm",
+            "doors_lock",
+            "signal_hold",
+            "signal_green",
+            "link_alarm",
+        ):
+            self.link_outbox.attach(kind, self.link_sink)
+        self.links = LinkService(
+            self.config.link, self.clock, self.link_log, self.bus, self.link_outbox
+        )
         self.namespace = Namespace(
             self.config.namespace.line, list(self.config.namespace.stations)
         )
@@ -136,11 +169,14 @@ class Platform:
 
         self._cycles = 0
         self._operations = 0
+        self._pending_link_release: tuple[str, str] | None = None
         self._event_counts: dict[str, int] = {}
         self.bus.subscribe("*", self._on_event)
         self._register_namespaces()
         self._seed(store)
         self._restore()
+        # 部分失败恢复：把事件流里"已登记但未确认投递"的副作用幂等重投。
+        self._link_redriven = self.links.redrive_pending()
 
     def _on_event(self, event: Event) -> None:
         """统计总线事件，供状态接口判断动作有没有真的流过组件。"""
@@ -161,6 +197,7 @@ class Platform:
             ("station", "interlock", "door-interlock"),
             ("station", "quota", "quota-counter"),
             ("station", "audit", "audit-sink"),
+            ("line", "link", "train-ground-radio"),
         ):
             self.namespaces.register(area, device, kind)
 
@@ -423,8 +460,21 @@ class Platform:
         return {**report, **summary, "arrival_audit": entry.id}
 
     def doors_open(self, train_id: str, station_id: str) -> dict:
-        """开门并确认车门：对位必须先落盘。"""
+        """开门并确认车门：对位必须先落盘，且链路放行闸门允许开门。
 
+        链路未纳入管控的车闸门不介入；降级车默认锁闭，只有当次人工确认
+        （:meth:`confirm_departure`）后才放行开门；彻底失联直接拒绝。
+        """
+
+        allowed, rule, adopted = self.links.can_open_doors(train_id, self.clock.now())
+        if not allowed:
+            self.audit.record(
+                "link_doors_blocked", train_id, station_id, rule=rule
+            )
+            raise RailError(
+                f"链路降级，开门联锁默认锁闭（{rule}）；须值班员当次确认",
+                component="link",
+            )
         report = open_doors(self.doors, train_id, self.clock.now())
         group = self._primary_group(station_id)
         if group:
@@ -455,6 +505,19 @@ class Platform:
                 "station_id": station_id,
                 "steps": steps,
                 "violations": ["发车配额已用完"],
+            }
+            summary = self._record_operation(op_id, "depart", report)
+            return {**report, **summary}
+
+        # 链路放行闸门：未纳入管控的车不介入；否则必须自动档或已人工确认/紧急覆盖。
+        link_block = self._link_depart_gate(train_id, station_id, steps)
+        if link_block is not None:
+            report = {
+                "ok": False,
+                "train_id": train_id,
+                "station_id": station_id,
+                "steps": steps,
+                "violations": [link_block],
             }
             summary = self._record_operation(op_id, "depart", report)
             return {**report, **summary}
@@ -507,6 +570,12 @@ class Platform:
         departure = depart(self.doors, train_id, self.clock.now())
         if gate is not None:
             self.lockouts.clear(gate.id)
+        # 发车完成：回收本次链路放行授权（开门联锁只对当次有效）。
+        if self._pending_link_release is not None:
+            released_train, request_id = self._pending_link_release
+            if released_train == train_id:
+                self.links.close_release(train_id, request_id, self.clock.now())
+            self._pending_link_release = None
         report = {
             "ok": True,
             "train_id": train_id,
@@ -607,6 +676,240 @@ class Platform:
             self.audit.record("position_rejected", train_id, "", reason=outcome["reason"])
         return {**outcome, "violations": [] if outcome["ok"] else [outcome["reason"]]}
 
+    # ---- 车地无线链路质量 ---------------------------------------------
+
+    def link_sample(
+        self,
+        train_id: str,
+        seq: int,
+        epoch: str,
+        rssi_dbm: float = -55.0,
+        snr_db: float = 25.0,
+        rtt_ms: float = 120.0,
+        packet_loss: float = 0.0,
+        position_m: int | None = None,
+        sent_at: float | None = None,
+    ) -> dict:
+        """接收一帧车地无线采样；链路可信时才顺带刷新位置，否则位置冻结。
+
+        这就是"车地无线一断、位置不能再假装停在最后一个值"的入口：位置是否落盘
+        由链路可信度决定，返回里同时给出 ``position_written`` 与可信度。
+        """
+
+        moment = self.clock.now()
+        if self.trains.get(train_id) is None:
+            self.trains.upsert(Train(id=train_id, line=self.namespace.line_id()))
+        sample = LinkSample(
+            train_id=train_id,
+            seq=int(seq),
+            epoch=str(epoch),
+            sent_at=moment if sent_at is None else float(sent_at),
+            at=moment,
+            rssi_dbm=float(rssi_dbm),
+            snr_db=float(snr_db),
+            rtt_ms=float(rtt_ms),
+            packet_loss=float(packet_loss),
+            position_m=None if position_m is None else int(position_m),
+        )
+        outcome = self.links.ingest(sample)
+        if outcome.get("accepted"):
+            if outcome.get("position_written") and position_m is not None:
+                refresh_position(self.positions, train_id, int(position_m), moment)
+                self.trend.append("train_position_m", moment, int(position_m))
+                self.audit.record(
+                    "link_position_applied", train_id,
+                    self._station_of(train_id), confidence=outcome["confidence"],
+                    position_m=int(position_m), epoch=outcome["epoch"], seq=outcome["seq"],
+                )
+            elif position_m is not None:
+                self.audit.record(
+                    "link_position_held", train_id, self._station_of(train_id),
+                    confidence=outcome["confidence"], contact=outcome["contact"],
+                    position_m=int(position_m),
+                )
+        else:
+            self.audit.record(
+                "link_sample_rejected", train_id, self._station_of(train_id),
+                reason=outcome.get("reason", "rejected"),
+            )
+        view = self.links.view(train_id, moment)
+        return {
+            "ok": bool(outcome.get("accepted")),
+            "train_id": train_id,
+            "accepted": outcome.get("accepted", False),
+            "reason": outcome.get("reason"),
+            "score": outcome.get("score"),
+            "confidence": view["confidence"],
+            "contact": view["contact"],
+            "mode": view["mode"],
+            "position_written": bool(outcome.get("position_written")),
+            "position_m": self.positions.get(train_id),
+            "frozen": not outcome.get("position_written", False),
+            "violations": [] if outcome.get("accepted") else [outcome.get("reason", "rejected")],
+        }
+
+    def link_view(self, train_id: str) -> dict:
+        """返回一列车的链路/可信度/位置视图。"""
+
+        return self.links.view(train_id, self.clock.now())
+
+    def link_tick(self, train_id: str | None = None) -> dict:
+        """推进链路控制周期（失联退避升级、探测调度、恢复再判定）。"""
+
+        moment = self.clock.now()
+        if train_id:
+            result = {train_id: self.links.tick(train_id, moment)}
+        else:
+            result = self.links.tick_all(moment)
+        return {"ok": True, "trains": result, "violations": []}
+
+    def link_redrive(self) -> dict:
+        """重投未确认的链路副作用（部分失败恢复）。"""
+
+        return {"ok": True, **self.links.redrive_pending(self.clock.now())}
+
+    def confirm_departure(self, train_id: str, request_id: str, operator: str) -> dict:
+        """降级期间值班员对当次发车的人工确认（默认锁闭，确认后才开门放行）。"""
+
+        result = self.links.confirm_release(train_id, request_id, operator, self.clock.now())
+        self.audit.record(
+            "link_manual_confirm", train_id, self._station_of(train_id),
+            request_id=request_id, operator=operator, ok=bool(result.get("ok")),
+            violations=list(result.get("violations", [])),
+        )
+        return result
+
+    def emergency_departure(
+        self, train_id: str, station_id: str, supervisor: str, reason: str
+    ) -> dict:
+        """彻底失联时高权限紧急覆盖旁路（强审计、双人责任留痕）。"""
+
+        result = self.links.emergency_override(
+            train_id, station_id, supervisor, reason, self.clock.now()
+        )
+        self.audit.record(
+            "link_emergency_override", train_id, station_id,
+            request_id=result.get("request_id"), supervisor=supervisor, reason=reason,
+            ok=bool(result.get("ok")),
+        )
+        return result
+
+    def link_release(self, train_id: str, station_id: str) -> dict:
+        """只做链路放行判定（不联动既有门控流程），供控制台/巡检单独观察。"""
+
+        return self.links.request_release(train_id, station_id, self.clock.now())
+
+    def close_link_release(self, train_id: str, request_id: str) -> dict:
+        """发车完成后关闭一次链路放行请求，回收当次开门授权。"""
+
+        return self.links.close_release(train_id, request_id, self.clock.now())
+
+    def link_replay(self, train_id: str) -> dict:
+        """重放一列车的完整链路事件链。"""
+
+        return {"train_id": train_id, "timeline": replay_train(self.link_log, train_id, self.config.link)}
+
+    def link_state_as_of(self, train_id: str, event_seq: int) -> dict:
+        """把一列车的链路状态重放到指定全局事件序号（含），还原"那一刻"。
+
+        用游标逐事件走到该序号并取当时视图，可与 :meth:`link_explain` 交叉核对，
+        回答"在第 N 条事件发生后，系统眼里这列车处于什么接触/可信度/放行档"。
+        """
+
+        target = self.link_log.find(int(event_seq))
+        if target is None:
+            return {"ok": False, "reason": "event_not_found", "event_seq": event_seq}
+        state = state_as_of(self.link_log, train_id, int(event_seq), self.config.link)
+        cursor = ReplayCursor.begin(train_id, self.config.link)
+        for event in self.link_log.for_train(train_id):
+            if event.seq > int(event_seq):
+                break
+            cursor.step(event)
+        return {
+            "ok": True,
+            "train_id": train_id,
+            "as_of_event_seq": int(event_seq),
+            "at": target.at,
+            "view": state.view(target.at, self.links.policy),
+            "cursor_seq": cursor.seq,
+        }
+
+    def link_explain(self, event_seq: int) -> dict:
+        """解释一次放行判定当时凭什么这么判。"""
+
+        event = self.link_log.find(int(event_seq))
+        if event is None:
+            return {"ok": False, "reason": "event_not_found", "event_seq": event_seq}
+        return {"ok": True, **explain_decision(event, self.link_log)}
+
+    def link_verify(self) -> dict:
+        """校验链路事件哈希链完整（历史不可变）。"""
+
+        return self.link_log.verify()
+
+    def _station_of(self, train_id: str) -> str:
+        train = self.trains.get(train_id)
+        return train.station if train else ""
+
+    def _link_depart_gate(self, train_id: str, station_id: str, steps: list[dict]) -> str | None:
+        """发车前的链路闸门核对。
+
+        * 未纳入链路管控（从未上报采样）：返回 ``None``，闸门不介入，兼容存量车；
+        * 自动档：放行，并在事件流上登记本次自动放行；
+        * 降级档：必须已有当次人工确认/紧急覆盖产生的开放授权，否则拒绝；
+        * 彻底失联：拒绝（紧急覆盖授权同样可放行）。
+
+        返回 ``None`` 表示通过，否则返回拒绝原因。
+        """
+
+        if not self.links.is_adopted(train_id):
+            return None
+        view = self.links.view(train_id, self.clock.now())
+        open_request = view.get("open_request")
+        if open_request is None:
+            decision = self.links.request_release(train_id, station_id, self.clock.now())
+            verdict_decision = decision.get("decision")
+            request_id = decision.get("request_id")
+        else:
+            verdict_decision = open_request.get("decision")
+            request_id = open_request.get("request_id")
+
+        if verdict_decision in ("auto_granted", "manual_armed", "emergency_override"):
+            steps.append(
+                {
+                    "component": "link",
+                    "action": "release",
+                    "detail": {
+                        "train_id": train_id,
+                        "decision": verdict_decision,
+                        "confidence": view["confidence"],
+                    },
+                }
+            )
+            self._pending_link_release = (train_id, request_id)
+            self.audit.record(
+                "link_release_passed", train_id, station_id,
+                request_id=request_id, decision=str(verdict_decision),
+                confidence=view["confidence"],
+            )
+            return None
+
+        reason = {
+            "manual_pending": "链路降级，发车按降级处理：默认锁闭，须值班员当次人工确认",
+            "inhibited": "车地无线彻底失联，禁止发车；仅高权限紧急覆盖可旁路",
+        }.get(str(verdict_decision), f"链路放行未通过（{view.get('mode')}/{verdict_decision}）")
+        steps.append(
+            {"component": "link", "action": "block",
+             "detail": {"train_id": train_id, "decision": str(verdict_decision),
+                        "confidence": view["confidence"]}}
+        )
+        self.audit.record(
+            "link_release_blocked", train_id, station_id,
+            request_id=request_id, decision=str(verdict_decision),
+            confidence=view["confidence"],
+        )
+        return reason
+
     def sequence_verdict(self, previous: int, step: int) -> dict:
         """推进门控事件序号并给出回绕判定。"""
 
@@ -675,9 +978,21 @@ class Platform:
             return {"ok": False, "violations": ["步长必须为正"], "cycle": self._cycles}
         self._cycles += 1
         moment = self.clock.now()
+        link_tick = self.links.tick_all(moment)
         stale = [
             train.id for train in self.trains.list() if self.positions.stale(train.id, moment)
         ]
+        link_degraded = [
+            train_id
+            for train_id, view in self.links.views(moment).items()
+            if view["mode"] != "auto"
+        ]
+        link_lost = [
+            train_id
+            for train_id, view in self.links.views(moment).items()
+            if view["contact"] == "lost"
+        ]
+        # 位置陈旧但链路仍显示自动可信是矛盾的，周期里显式暴露，防止"假在动"。
         interlock = interlock_status(self.faults, self.gates, self.config.interlock.max_locked_ratio)
         holding = [
             train.id
@@ -693,6 +1008,9 @@ class Platform:
             "cycle": self._cycles,
             "dt": dt,
             "stale_positions": stale,
+            "link_tick": link_tick,
+            "link_degraded": link_degraded,
+            "link_lost": link_lost,
             "locked_count": interlock["locked_count"],
             "can_release_depart": interlock["can_release_depart"],
             "ready_trains": holding,
@@ -732,6 +1050,14 @@ class Platform:
             "console_hits": len(self.bus.history("console")),
             "stations": [station.as_dict() for station in self.stations.list()],
             "trains": {train.id: train_state(train.id, self.align, self.train_doors, self.positions) for train in trains},
+            "link": {
+                train_id: self.links.view(train_id, self.clock.now())
+                for train_id in self.links.adopted_trains()
+            },
+            "link_effects": self.link_sink.effects(),
+            "link_events": len(self.link_log),
+            "link_pending_on_boot": self._link_redriven,
+            "link_chain": self.link_log.verify(),
             "doors": [
                 {**gate.as_dict(), "open": gate.open, "locked": gate.locked}
                 for gate in self.gates.list()
@@ -785,6 +1111,7 @@ class Platform:
             "doors": door_state(self.doors, train_id),
             "aspect": aspect_of(self.signals, train_id),
             "gap": self.gaps.state(train_id),
+            "link": self.links.view(train_id, self.clock.now()),
         }
 
     def station_view(self, station_id: str) -> dict:

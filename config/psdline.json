@@ -36,6 +36,31 @@
     "stale_after_s": 8.0,
     "sequence_modulus": 65536
   },
+  "link": {
+    "window_s": 5.0,
+    "fresh_s": 2.0,
+    "stale_s": 12.0,
+    "loss_s": 20.0,
+    "rssi_good_dbm": -65.0,
+    "rssi_bad_dbm": -90.0,
+    "snr_good_db": 20.0,
+    "snr_bad_db": 5.0,
+    "rtt_good_ms": 150.0,
+    "rtt_bad_ms": 800.0,
+    "loss_good": 0.02,
+    "loss_bad": 0.20,
+    "sample_good_score": 0.70,
+    "window_good_score": 0.70,
+    "recover_good_samples": 3,
+    "confidence_auto": 0.85,
+    "confidence_manual": 0.30,
+    "backoff_base_s": 1.0,
+    "backoff_factor": 2.0,
+    "backoff_max_s": 30.0,
+    "backoff_jitter_pct": 0.10,
+    "clock_skew_s": 5.0,
+    "journal_segment": 512
+  },
   "interlock": {
     "hold_after_fault_s": 3.0,
     "max_locked_ratio": 0.5

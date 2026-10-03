@@ -80,6 +80,41 @@ class SignalSection:
 
 
 @dataclass(frozen=True)
+class LinkSection:
+    """车地无线链路质量与降级放行限值。
+
+    可信度采用"断线时长为主、近窗质量为辅"的混合口径：只要最近一个报文在
+    ``fresh_s`` 内且窗口质量达标，可信度为 1；报文仍能到达但质量差时按窗口质量
+    打折；报文彻底中断后按距最后一个报文的时长线性衰减到 0。这样彻底失联时可信度
+    必然掉光，不会因为近窗指标冻结而给出"车没动"的假象。
+    """
+
+    window_s: float = 5.0
+    fresh_s: float = 2.0
+    stale_s: float = 12.0
+    loss_s: float = 20.0
+    rssi_good_dbm: float = -65.0
+    rssi_bad_dbm: float = -90.0
+    snr_good_db: float = 20.0
+    snr_bad_db: float = 5.0
+    rtt_good_ms: float = 150.0
+    rtt_bad_ms: float = 800.0
+    loss_good: float = 0.02
+    loss_bad: float = 0.20
+    sample_good_score: float = 0.70
+    window_good_score: float = 0.70
+    recover_good_samples: int = 3
+    confidence_auto: float = 0.85
+    confidence_manual: float = 0.30
+    backoff_base_s: float = 1.0
+    backoff_factor: float = 2.0
+    backoff_max_s: float = 30.0
+    backoff_jitter_pct: float = 0.10
+    clock_skew_s: float = 5.0
+    journal_segment: int = 512
+
+
+@dataclass(frozen=True)
 class InterlockSection:
     """联锁限值。"""
 
@@ -121,6 +156,7 @@ class PlatformConfig:
     door: DoorSection = field(default_factory=DoorSection)
     gap: GapSection = field(default_factory=GapSection)
     signal: SignalSection = field(default_factory=SignalSection)
+    link: LinkSection = field(default_factory=LinkSection)
     interlock: InterlockSection = field(default_factory=InterlockSection)
     quota: QuotaSection = field(default_factory=QuotaSection)
     audit: AuditSection = field(default_factory=AuditSection)
@@ -163,6 +199,28 @@ class PlatformConfig:
             raise ConfigError("位置过期时间必须为正", component="config")
         if self.signal.sequence_modulus != 65536:
             raise ConfigError("序号模数固定为 65536", component="config")
+        if not 0 < self.link.window_s:
+            raise ConfigError("链路质量窗口必须为正", component="config")
+        if not 0 < self.link.fresh_s <= self.link.stale_s <= self.link.loss_s:
+            raise ConfigError(
+                "链路时限必须满足 0 < fresh_s <= stale_s <= loss_s", component="config"
+            )
+        if not 0 < self.link.sample_good_score <= 1:
+            raise ConfigError("单采样合格阈值必须落在 (0, 1]", component="config")
+        if not 0 < self.link.window_good_score <= 1:
+            raise ConfigError("窗口合格阈值必须落在 (0, 1]", component="config")
+        if self.link.recover_good_samples <= 0:
+            raise ConfigError("恢复所需连续好采样数必须为正", component="config")
+        if not 0 < self.link.confidence_manual <= self.link.confidence_auto <= 1:
+            raise ConfigError(
+                "可信度阈值必须满足 0 < 手动 <= 自动 <= 1", component="config"
+            )
+        if self.link.backoff_base_s <= 0 or self.link.backoff_max_s < self.link.backoff_base_s:
+            raise ConfigError("退避基数为正且退避上限不得小于基数", component="config")
+        if not 0 <= self.link.backoff_jitter_pct < 1:
+            raise ConfigError("退避抖动比例必须落在 [0, 1)", component="config")
+        if self.link.journal_segment <= 0:
+            raise ConfigError("链路事件分段长度必须为正", component="config")
         if not 0 < self.interlock.max_locked_ratio <= 1:
             raise ConfigError("锁定比例上限必须落在 (0, 1]", component="config")
         if self.quota.arrival_limit <= 0 or self.quota.depart_limit <= 0:
@@ -210,6 +268,7 @@ def config_to_mapping(config: PlatformConfig) -> dict:
         "door": dict(config.door.__dict__),
         "gap": dict(config.gap.__dict__),
         "signal": dict(config.signal.__dict__),
+        "link": dict(config.link.__dict__),
         "interlock": dict(config.interlock.__dict__),
         "quota": dict(config.quota.__dict__),
         "audit": dict(config.audit.__dict__),
@@ -230,6 +289,7 @@ def config_from_mapping(payload: dict) -> PlatformConfig:
         door=_section(DoorSection, payload.get("door")),
         gap=_section(GapSection, payload.get("gap")),
         signal=_section(SignalSection, payload.get("signal")),
+        link=_section(LinkSection, payload.get("link")),
         interlock=_section(InterlockSection, payload.get("interlock")),
         quota=_section(QuotaSection, payload.get("quota")),
         audit=_section(AuditSection, payload.get("audit")),

@@ -11,7 +11,7 @@ from html import escape
 
 from ..app import Platform
 
-PAGE_PATHS: tuple[str, ...] = ("/", "/trains", "/doors", "/alarms")
+PAGE_PATHS: tuple[str, ...] = ("/", "/trains", "/doors", "/link", "/alarms")
 
 _STYLE = """
 body { font-family: ui-sans-serif, system-ui, sans-serif; margin: 0; background: #101820; color: #e8eef5; }
@@ -30,6 +30,7 @@ _NAV: tuple[tuple[str, str], ...] = (
     ("/", "站台"),
     ("/trains", "列车"),
     ("/doors", "门控"),
+    ("/link", "链路"),
     ("/alarms", "告警"),
 )
 
@@ -196,10 +197,53 @@ def _alarm_page(platform: Platform) -> str:
     return _shell("告警控制台", body)
 
 
+def _link_page(platform: Platform) -> str:
+    """链路页：每列车的接触状态、位置可信度、放行档位与退避。"""
+
+    status = platform.status()
+    links = status.get("link", {})
+    mode_label = {"auto": "自动放行", "manual": "降级·人工确认", "blocked": "禁止"}
+    body = _table(
+        "链路总览",
+        [
+            ("纳入管控列车", len(links)),
+            ("链路事件数", status.get("link_events", 0)),
+            ("哈希链", "完整" if status.get("link_chain", {}).get("ok") else "断裂"),
+            ("启动时补偿副作用", status.get("link_pending_on_boot", {}).get("retried", 0)),
+        ],
+    )
+
+    def cell(train_id: str, item: dict) -> str:
+        mode = item.get("mode", "")
+        cls = "ok" if mode == "auto" else ("warn" if mode == "manual" else "alarm")
+        return (
+            f"{escape(train_id)} "
+            f'接触 <b>{escape(str(item.get("contact")))}</b> '
+            f'档位 <span class="{cls}">{escape(mode_label.get(mode, mode))}</span> '
+            f"可信度 {item.get('confidence')} 窗口 {item.get('window_score')} "
+            f"位置 {item.get('position_m')}（龄 {item.get('position_age_s')} s）"
+            f" 退避档 {item.get('backoff_level')}"
+        )
+
+    body += _table(
+        "车地无线链路与位置可信度",
+        [(train_id, cell(train_id, item)) for train_id, item in sorted(links.items())]
+        or [("暂无", "尚无列车上报链路采样")],
+    )
+    effects = status.get("link_effects", [])
+    body += _table(
+        "最近下发的现场副作用（信号/门控/告警）",
+        [(item.get("effect_id", ""), item.get("kind", "")) for item in effects[-12:]]
+        or [("暂无", "-")],
+    )
+    return _shell("车地无线链路控制台", body)
+
+
 _RENDERERS = {
     "/": _station_page,
     "/trains": _train_page,
     "/doors": _door_page,
+    "/link": _link_page,
     "/alarms": _alarm_page,
 }
 
