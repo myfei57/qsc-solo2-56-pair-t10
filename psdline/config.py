@@ -80,6 +80,21 @@ class SignalSection:
 
 
 @dataclass(frozen=True)
+class LinkSection:
+    """车地链路质量限值。"""
+
+    expected_period_s: float = 1.0
+    window_s: float = 10.0
+    good_threshold: float = 0.8
+    degraded_threshold: float = 0.5
+    lost_after_s: float = 5.0
+    recover_samples: int = 3
+    backoff_base_s: float = 2.0
+    backoff_max_s: float = 30.0
+    max_clock_skew_s: float = 2.0
+
+
+@dataclass(frozen=True)
 class InterlockSection:
     """联锁限值。"""
 
@@ -121,6 +136,7 @@ class PlatformConfig:
     door: DoorSection = field(default_factory=DoorSection)
     gap: GapSection = field(default_factory=GapSection)
     signal: SignalSection = field(default_factory=SignalSection)
+    link: LinkSection = field(default_factory=LinkSection)
     interlock: InterlockSection = field(default_factory=InterlockSection)
     quota: QuotaSection = field(default_factory=QuotaSection)
     audit: AuditSection = field(default_factory=AuditSection)
@@ -163,6 +179,20 @@ class PlatformConfig:
             raise ConfigError("位置过期时间必须为正", component="config")
         if self.signal.sequence_modulus != 65536:
             raise ConfigError("序号模数固定为 65536", component="config")
+        if self.link.expected_period_s <= 0:
+            raise ConfigError("链路期望周期必须为正", component="config")
+        if self.link.window_s < self.link.expected_period_s:
+            raise ConfigError("链路窗口不能小于期望周期", component="config")
+        if not 0 < self.link.degraded_threshold < self.link.good_threshold <= 1:
+            raise ConfigError("链路阈值必须满足 0 < 降级 < 良好 <= 1", component="config")
+        if self.link.lost_after_s < self.link.expected_period_s:
+            raise ConfigError("失联判定时间不能小于期望周期", component="config")
+        if self.link.recover_samples <= 0:
+            raise ConfigError("恢复所需连续好采样数必须为正", component="config")
+        if self.link.backoff_base_s <= 0 or self.link.backoff_max_s < self.link.backoff_base_s:
+            raise ConfigError("退避区间必须满足 0 < 基数 <= 上限", component="config")
+        if self.link.max_clock_skew_s < 0:
+            raise ConfigError("时钟偏移容忍不能为负", component="config")
         if not 0 < self.interlock.max_locked_ratio <= 1:
             raise ConfigError("锁定比例上限必须落在 (0, 1]", component="config")
         if self.quota.arrival_limit <= 0 or self.quota.depart_limit <= 0:
@@ -210,6 +240,7 @@ def config_to_mapping(config: PlatformConfig) -> dict:
         "door": dict(config.door.__dict__),
         "gap": dict(config.gap.__dict__),
         "signal": dict(config.signal.__dict__),
+        "link": dict(config.link.__dict__),
         "interlock": dict(config.interlock.__dict__),
         "quota": dict(config.quota.__dict__),
         "audit": dict(config.audit.__dict__),
@@ -230,6 +261,7 @@ def config_from_mapping(payload: dict) -> PlatformConfig:
         door=_section(DoorSection, payload.get("door")),
         gap=_section(GapSection, payload.get("gap")),
         signal=_section(SignalSection, payload.get("signal")),
+        link=_section(LinkSection, payload.get("link")),
         interlock=_section(InterlockSection, payload.get("interlock")),
         quota=_section(QuotaSection, payload.get("quota")),
         audit=_section(AuditSection, payload.get("audit")),

@@ -23,6 +23,7 @@ packages = [
     "psdline.door",
     "psdline.platform",
     "psdline.gap",
+    "psdline.link",
     "psdline.quota",
     "psdline.audit",
     "psdline.console",

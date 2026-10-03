@@ -10,9 +10,11 @@
 
 from __future__ import annotations
 
+import threading
+
 from .audit import AuditLog, build_timeline
 from .clock import Clock, SystemClock
-from .config import PlatformConfig, default_config, with_storage_root
+from .config import LinkSection, PlatformConfig, default_config, with_storage_root
 from .door import (
     DoorController,
     active_group,
@@ -29,7 +31,7 @@ from .door import (
     process_queue,
     queued_total,
 )
-from .errors import RailError
+from .errors import InterlockError, RailError
 from .eventbus import Event, EventBus
 from .gap import GapRegistry, gap_summary
 from .ids import IdFactory
@@ -42,6 +44,7 @@ from .interlock import (
     restore_lockouts,
     verdict_of,
 )
+from .link import REDUCED, UNTRUSTED, LinkMonitor, LinkTuning, replay_train
 from .ns import Namespace, NamespaceRegistry
 from .platform import MappingRegistry, adjacent, group_keys, physical_groups, resolve
 from .psd import LockoutRegistry, PSD, PSDRegistry, sweep_station
@@ -119,6 +122,12 @@ class Platform:
             stale_after_s=self.config.signal.stale_after_s,
         )
         self.routes = RouteRegistry(store)
+        self.link = LinkMonitor(
+            JsonlJournal(store.root, "link", segment_limit=self.config.audit.journal_segment),
+            _link_tuning(self.config.link),
+        )
+        self._train_locks: dict[str, threading.RLock] = {}
+        self._train_locks_guard = threading.RLock()
 
         self.gates = PSDRegistry(store)
         self.lockouts = LockoutRegistry(self.gates)
@@ -213,13 +222,14 @@ class Platform:
         )
 
     def _restore(self) -> None:
-        """从落盘状态恢复操作计数与锁定状态。"""
+        """从落盘状态恢复操作计数、锁定状态与链路会话。"""
 
         state = self.store.read("platform/state")
         if isinstance(state, dict):
             self._operations = int(state.get("operations", 0))
             self._cycles = int(state.get("cycles", 0))
         restore_lockouts(self.faults, self.gates, self.lockouts, not self.gaps.blocked_ids())
+        self.link.restore()
 
     def _persist(self) -> None:
         """落盘平台计数，供重启后对照。"""
@@ -296,6 +306,133 @@ class Platform:
             "audit_id": entry.id,
         }
 
+    # ---- 链路质量监督 --------------------------------------------------
+
+    def _lock_for(self, train_id: str) -> threading.RLock:
+        """返回一列车的控制锁：采样、位置写入与闸门判定按列车串行。"""
+
+        with self._train_locks_guard:
+            return self._train_locks.setdefault(train_id, threading.RLock())
+
+    def _audit_link_decisions(self, train_id: str, decisions: list[dict]) -> None:
+        """把链路状态判定逐条落审计（证据随判定一起落盘，供事后重放）。"""
+
+        for decision in decisions:
+            kind = "link_backoff" if decision.get("kind") == "backoff" else "link_state"
+            detail = {
+                key: value
+                for key, value in decision.items()
+                if key not in ("type", "kind", "train_id", "at")
+            }
+            self.audit.record(kind, train_id, "", decision_at=decision.get("at"), **detail)
+
+    def _write_trust(self, train_id: str, verdict: dict) -> None:
+        """把位置可信度标注落盘；可信度等级变化时补一条审计。"""
+
+        doc_id = f"train/{train_id}/trust"
+        previous = self.store.read(doc_id)
+        level = verdict["trust"]
+        self.store.write(
+            doc_id,
+            {
+                "train_id": train_id,
+                "level": level,
+                "state": verdict["state"],
+                "quality": verdict["quality"],
+                "backoff_level": verdict["backoff_level"],
+                "at": self.clock.now(),
+            },
+        )
+        if not isinstance(previous, dict) or previous.get("level") != level:
+            self.audit.record(
+                "position_trust",
+                train_id,
+                "",
+                level=level,
+                state=verdict["state"],
+                quality=verdict["quality"],
+            )
+
+    def _trust_view(self, train_id: str) -> dict:
+        """当前位置可信度：以链路监控器为准；监控器没有会话时（例如链路流水
+        缺失的部分失败）回退到落盘标注。"""
+
+        trust = self.link.trust(train_id)
+        if trust is not None:
+            return {"level": trust, "source": "live"}
+        raw = self.store.read(f"train/{train_id}/trust")
+        if isinstance(raw, dict):
+            return {"level": raw.get("level"), "source": "doc", **raw}
+        return {"level": None, "source": "none"}
+
+    def _link_gate(
+        self,
+        train_id: str,
+        station_id: str,
+        action: str,
+        *,
+        operator: str = "",
+        confirm_degraded: bool = False,
+    ) -> dict:
+        """发车／开门前的链路闸门。
+
+        返回 ``{"passed": True, "trust": ...}`` 表示放行；否则 ``passed`` 为
+        ``False`` 且 ``report`` 带拒绝原因。彻底失联一律拒绝（退避），降级
+        需要人工确认，确认人写进审计。无链路会话的列车走既有路径。
+        """
+
+        verdict = self.link.evaluate(train_id, self.clock.now())
+        if verdict is None:
+            return {"passed": True, "trust": None}
+        self._audit_link_decisions(train_id, verdict["decisions"])
+        trust = verdict["trust"]
+        evidence = {
+            "quality": verdict["quality"],
+            "state": verdict["state"],
+            "silence_s": verdict["silence_s"],
+            "backoff_level": verdict["backoff_level"],
+        }
+        if trust == UNTRUSTED:
+            reason = "车地链路失联，发车退避" if action == "depart" else "车地链路失联，禁止开门"
+            self.audit.record(f"{action}_lost_blocked", train_id, station_id, **evidence)
+            return {
+                "passed": False,
+                "trust": trust,
+                "report": {
+                    "ok": False,
+                    "train_id": train_id,
+                    "station_id": station_id,
+                    "trust": trust,
+                    "steps": [],
+                    "violations": [reason],
+                    "evidence": evidence,
+                },
+            }
+        if trust == REDUCED:
+            confirmed = bool(operator) and (confirm_degraded if action == "depart" else True)
+            if not confirmed:
+                reason = (
+                    "链路降级，发车需人工确认" if action == "depart" else "链路降级，开门需人工确认"
+                )
+                self.audit.record(f"{action}_degraded_blocked", train_id, station_id, **evidence)
+                return {
+                    "passed": False,
+                    "trust": trust,
+                    "report": {
+                        "ok": False,
+                        "train_id": train_id,
+                        "station_id": station_id,
+                        "trust": trust,
+                        "steps": [],
+                        "violations": [reason],
+                        "evidence": evidence,
+                    },
+                }
+            self.audit.record(
+                f"{action}_degraded", train_id, station_id, operator=operator, **evidence
+            )
+        return {"passed": True, "trust": trust}
+
     # ---- 生命周期 -----------------------------------------------------
 
     def start(self) -> dict:
@@ -346,7 +483,7 @@ class Platform:
 
     # ---- 到发编排 -----------------------------------------------------
 
-    def arrive(self, train_id: str, station_id: str, position_m: int) -> dict:
+    def arrive(self, train_id: str, station_id: str, position_m: int, operator: str = "") -> dict:
         """到站到开门：信号到站 → 停稳对位 → 对位落盘 → 开门。"""
 
         op_id = self.ids.labeled("arrive")
@@ -405,7 +542,7 @@ class Platform:
             }
         )
         try:
-            self.doors_open(train_id, station_id)
+            self.doors_open(train_id, station_id, operator=operator)
         except RailError as error:
             return reject(error.message)
         entry = self.audit.record(ARRIVAL, train_id, station_id, position_m=position_m)
@@ -422,9 +559,12 @@ class Platform:
         self._persist()
         return {**report, **summary, "arrival_audit": entry.id}
 
-    def doors_open(self, train_id: str, station_id: str) -> dict:
-        """开门并确认车门：对位必须先落盘。"""
+    def doors_open(self, train_id: str, station_id: str, operator: str = "") -> dict:
+        """开门并确认车门：对位必须先落盘；链路降级需人工确认，失联禁止开门。"""
 
+        gate = self._link_gate(train_id, station_id, "door_open", operator=operator)
+        if not gate["passed"]:
+            raise InterlockError(gate["report"]["violations"][0], component="link")
         report = open_doors(self.doors, train_id, self.clock.now())
         group = self._primary_group(station_id)
         if group:
@@ -443,8 +583,18 @@ class Platform:
         )
         return {**report, "group": group}
 
-    def depart(self, train_id: str, station_id: str) -> dict:
-        """关门到发车：关门指令 → 间隙探测 → 关门落盘 → 发车信号。"""
+    def depart(
+        self,
+        train_id: str,
+        station_id: str,
+        operator: str = "",
+        confirm_degraded: bool = False,
+    ) -> dict:
+        """关门到发车：链路闸门 → 关门指令 → 间隙探测 → 关门落盘 → 发车信号。
+
+        链路闸门放在最前面：彻底失联直接退避（不产生任何门控副作用），
+        降级必须人工确认后才按降级模式放行，确认人与链路证据落审计。
+        """
 
         op_id = self.ids.labeled("depart")
         steps: list[dict] = []
@@ -458,6 +608,22 @@ class Platform:
             }
             summary = self._record_operation(op_id, "depart", report)
             return {**report, **summary}
+
+        gate = self._link_gate(
+            train_id, station_id, "depart", operator=operator, confirm_degraded=confirm_degraded
+        )
+        if not gate["passed"]:
+            summary = self._record_operation(op_id, "depart", gate["report"])
+            return {**gate["report"], **summary}
+        trust = gate["trust"]
+        if trust == REDUCED:
+            steps.append(
+                {
+                    "component": "link",
+                    "action": "degraded_confirmed",
+                    "detail": {"train_id": train_id, "operator": operator},
+                }
+            )
 
         gate = self._primary_gate(station_id)
         if gate is not None and not self.lockouts.is_locked(gate.id):
@@ -514,6 +680,8 @@ class Platform:
             "close_durable": bool(closed["close_durable"]),
             "aspect": verdict["aspect"],
             "cleared_commands": departure["cleared_commands"],
+            "mode": "degraded" if trust == REDUCED else "normal",
+            "trust": trust or "unevaluated",
             "steps": steps,
             "violations": [],
         }
@@ -597,15 +765,109 @@ class Platform:
         self.audit.record("interlock_arm", train_id, "", armed=state)
         return {"ok": True, "train_id": train_id, "armed": state, "violations": []}
 
-    def refresh_position(self, train_id: str, position_m: int) -> dict:
-        """按信号刷新列车位置。"""
+    def refresh_position(
+        self,
+        train_id: str,
+        position_m: int,
+        seq: int | None = None,
+        rtt_ms: float | None = None,
+        sent_at: float | None = None,
+    ) -> dict:
+        """按信号刷新列车位置。
 
-        outcome = refresh_position(self.positions, train_id, position_m, self.clock.now())
-        if outcome["ok"]:
-            self.trend.append("train_position_m", self.clock.now(), position_m)
-        else:
-            self.audit.record("position_rejected", train_id, "", reason=outcome["reason"])
-        return {**outcome, "violations": [] if outcome["ok"] else [outcome["reason"]]}
+        位置报文同时是链路证据：先过链路监控（写前日志），再按当前可信度
+        决定怎么用这个位置——降级时接受但打标，彻底失联时保持最后可信值
+        并明确标注（退避），不再静默冻结看着像车没动。
+        """
+
+        now = self.clock.now()
+        with self._lock_for(train_id):
+            verdict = self.link.ingest(
+                train_id, seq=seq, rtt_ms=rtt_ms, sent_at=sent_at, now=now
+            )
+            self._audit_link_decisions(train_id, verdict["decisions"])
+            if not verdict["counted"]:
+                return {
+                    "ok": False,
+                    "train_id": train_id,
+                    "reason": verdict["note"] or "ignored",
+                    "trust": verdict["trust"],
+                    "violations": [],
+                }
+            if verdict["trust"] == UNTRUSTED:
+                self.audit.record(
+                    "position_held",
+                    train_id,
+                    "",
+                    quality=verdict["quality"],
+                    state=verdict["state"],
+                    backoff_level=verdict["backoff_level"],
+                )
+                return {
+                    "ok": False,
+                    "train_id": train_id,
+                    "reason": "link_lost",
+                    "trust": verdict["trust"],
+                    "violations": ["车地链路失联，位置保持最后可信值"],
+                }
+            outcome = refresh_position(self.positions, train_id, position_m, now)
+            if outcome["ok"]:
+                self._write_trust(train_id, verdict)
+                self.trend.append("train_position_m", now, position_m)
+            else:
+                self.audit.record("position_rejected", train_id, "", reason=outcome["reason"])
+            return {
+                **outcome,
+                "trust": verdict["trust"],
+                "quality": verdict["quality"],
+                "violations": [] if outcome["ok"] else [outcome["reason"]],
+            }
+
+    def link_sample(
+        self,
+        train_id: str,
+        ok: bool = True,
+        seq: int | None = None,
+        rtt_ms: float | None = None,
+        sent_at: float | None = None,
+    ) -> dict:
+        """登记一条纯链路采样（无线前端心跳，不带位置）。"""
+
+        now = self.clock.now()
+        with self._lock_for(train_id):
+            verdict = self.link.ingest(
+                train_id, ok=ok, seq=seq, rtt_ms=rtt_ms, sent_at=sent_at, now=now
+            )
+            self._audit_link_decisions(train_id, verdict["decisions"])
+        return {
+            "ok": True,
+            "train_id": train_id,
+            "counted": verdict["counted"],
+            "note": verdict["note"],
+            "state": verdict["state"],
+            "trust": verdict["trust"],
+            "quality": verdict["quality"],
+            "violations": [],
+        }
+
+    def link_summary(self) -> dict:
+        """返回全部链路会话的汇总视图。"""
+
+        return self.link.summary(now=self.clock.now())
+
+    def link_view(self, train_id: str) -> dict | None:
+        """返回一列车的链路详情；无会话时返回 ``None``。"""
+
+        view = self.link.describe(train_id, self.clock.now())
+        if view is None:
+            return None
+        view["trust_doc"] = self._trust_view(train_id)
+        return view
+
+    def replay_link(self, train_id: str) -> dict:
+        """重放一列车的链路判定：凭什么这么判，当场重算给你看。"""
+
+        return replay_train(self.link.journal.read_all(), train_id, self.link.tuning)
 
     def sequence_verdict(self, previous: int, step: int) -> dict:
         """推进门控事件序号并给出回绕判定。"""
@@ -678,6 +940,10 @@ class Platform:
         stale = [
             train.id for train in self.trains.list() if self.positions.stale(train.id, moment)
         ]
+        link_tick = self.link.tick(moment)
+        for train_id, info in link_tick.items():
+            self._audit_link_decisions(train_id, info["decisions"])
+        link_summary = self.link.summary(now=moment)
         interlock = interlock_status(self.faults, self.gates, self.config.interlock.max_locked_ratio)
         holding = [
             train.id
@@ -697,6 +963,7 @@ class Platform:
             "can_release_depart": interlock["can_release_depart"],
             "ready_trains": holding,
             "gaps": gap_summary(self.gaps, [train.id for train in self.trains.list()]),
+            "link": link_summary,
             "violations": [],
         }
 
@@ -742,6 +1009,7 @@ class Platform:
                 self.faults, self.gates, self.config.interlock.max_locked_ratio
             ),
             "gaps": gap_summary(self.gaps, ids),
+            "link": self.link.summary(now=self.clock.now()),
             "quota": {
                 ARRIVAL: self.quotas.status(ARRIVAL),
                 DEPART: self.quotas.status(DEPART),
@@ -785,6 +1053,9 @@ class Platform:
             "doors": door_state(self.doors, train_id),
             "aspect": aspect_of(self.signals, train_id),
             "gap": self.gaps.state(train_id),
+            "trust": self._trust_view(train_id),
+            "position_trust": self.store.read(f"train/{train_id}/trust"),
+            "link": self.link.describe(train_id, self.clock.now()),
         }
 
     def station_view(self, station_id: str) -> dict:
@@ -874,6 +1145,22 @@ class Platform:
         if not keys:
             return {}
         return {keys[0]: adjacent(self.mappings, station_id, keys[0])}
+
+
+def _link_tuning(section: LinkSection) -> LinkTuning:
+    """把配置小节映射成链路监控器的限值。"""
+
+    return LinkTuning(
+        expected_period_s=section.expected_period_s,
+        window_s=section.window_s,
+        good_threshold=section.good_threshold,
+        degraded_threshold=section.degraded_threshold,
+        lost_after_s=section.lost_after_s,
+        recover_samples=section.recover_samples,
+        backoff_base_s=section.backoff_base_s,
+        backoff_max_s=section.backoff_max_s,
+        max_clock_skew_s=section.max_clock_skew_s,
+    )
 
 
 def build_platform(

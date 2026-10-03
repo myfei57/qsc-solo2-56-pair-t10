@@ -87,6 +87,12 @@ def _cmd_demo(args: argparse.Namespace) -> int:
     cycles = [platform.cycle(dt=args.dt) for _ in range(args.cycles)]
     final_sweep = platform.sweep(args.station)
 
+    # 链路降级演示需要可推进时钟来模拟断链静默；真实时钟下跳过。
+    if isinstance(clock, ManualClock):
+        link_demo = _demo_link_degradation(platform, clock, args.station)
+    else:
+        link_demo = {"skipped": True, "reason": "真实时钟下不断链演示"}
+
     # 演示自检用临时端口，避免和本机常驻服务抢 8080。
     server = ConsoleServer(platform, port=0)
     base_url = server.start()
@@ -113,6 +119,7 @@ def _cmd_demo(args: argparse.Namespace) -> int:
         "cycles_run": len(cycles),
         "last_cycle": cycles[-1],
         "final_sweep": {key: final_sweep[key] for key in ("closed", "scanned")},
+        "link_demo": link_demo,
         "probe": probe,
         "status": platform.status(),
     }
@@ -129,10 +136,52 @@ def _cmd_demo(args: argparse.Namespace) -> int:
     ):
         if not operation.get("ok"):
             failures.extend(f"{name}:{item}" for item in operation.get("violations", []))
+    if not link_demo.get("skipped"):
+        if link_demo["lost_block"]["ok"] or link_demo["confirm_block"]["ok"]:
+            failures.append("link_demo:失联与降级未确认时应被拒绝")
+        if not link_demo["degraded"]["ok"] or link_demo["degraded"].get("mode") != "degraded":
+            failures.append("link_demo:人工确认后应按降级模式放行")
+        if not link_demo["replay_consistent"]:
+            failures.append("link_demo:链路判定重放不一致")
     if failures:
         print(f"检查未通过: {failures}", file=sys.stderr)
         return 1
     return 0
+
+
+def _demo_link_degradation(platform: Platform, clock: ManualClock, station_id: str) -> dict:
+    """演示链路降级链：断链退避 → 恢复观察 → 人工确认降级放行 → 重放核对。"""
+
+    train_id = "T02"
+    platform.arrive(train_id, station_id, 0)
+    platform.check_gap(train_id)
+    for _ in range(3):
+        platform.link_sample(train_id)
+        clock.advance(1)
+    clock.advance(6)  # 静默超过失联判定时间
+    platform.cycle()
+    lost_block = platform.depart(train_id, station_id)
+    for _ in range(8):  # 窗口式恢复：连续好采样把窗口质量抬回降级区
+        clock.advance(1)
+        platform.link_sample(train_id)
+    platform.cycle()
+    confirm_block = platform.depart(train_id, station_id)
+    degraded = platform.depart(
+        train_id, station_id, operator="dispatcher-1", confirm_degraded=True
+    )
+    replay = platform.replay_link(train_id)
+    return {
+        "skipped": False,
+        "lost_block": {"ok": lost_block["ok"], "violations": lost_block["violations"]},
+        "confirm_block": {"ok": confirm_block["ok"], "violations": confirm_block["violations"]},
+        "degraded": {
+            "ok": degraded["ok"],
+            "mode": degraded.get("mode"),
+            "violations": degraded["violations"],
+        },
+        "replay_consistent": replay["consistent"],
+        "decisions": len(replay["decisions"]),
+    }
 
 
 def _mirror_mapping(platform: Platform, station_id: str) -> dict[str, str]:

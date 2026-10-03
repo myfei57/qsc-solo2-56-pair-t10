@@ -66,6 +66,9 @@ class Api:
         add("GET", "/api/doors/{psdID}", self._gate)
         add("GET", "/api/interlock", lambda params, body: self._platform.status()["interlock"])
         add("GET", "/api/gaps", lambda params, body: self._platform.status()["gaps"])
+        add("GET", "/api/link", lambda params, body: self._platform.link_summary())
+        add("GET", "/api/link/{trainID}", self._link_train)
+        add("GET", "/api/link/{trainID}/replay", self._link_replay)
         add("GET", "/api/quota", lambda params, body: self._platform.status()["quota"])
         add("GET", "/api/audit", self._audit)
         add("GET", "/api/timeline", self._timeline)
@@ -85,6 +88,7 @@ class Api:
         add("POST", "/api/clear-fault", self._clear_fault)
         add("POST", "/api/arm", self._arm)
         add("POST", "/api/position", self._position)
+        add("POST", "/api/link/sample", self._link_sample)
         add("POST", "/api/sequence", self._sequence)
         add("POST", "/api/cycle", self._cycle)
         add("POST", "/api/sweep", self._sweep)
@@ -192,10 +196,16 @@ class Api:
             _require(body, "train_id"),
             _require(body, "station_id"),
             _as_int(body, "position_m", 0),
+            operator=str(body.get("operator", "")),
         )
 
     def _depart(self, params: dict, body: dict) -> dict:
-        return self._platform.depart(_require(body, "train_id"), _require(body, "station_id"))
+        return self._platform.depart(
+            _require(body, "train_id"),
+            _require(body, "station_id"),
+            operator=str(body.get("operator", "")),
+            confirm_degraded=bool(body.get("confirm_degraded", False)),
+        )
 
     def _gap(self, params: dict, body: dict) -> dict:
         return self._platform.check_gap(_require(body, "train_id"), bool(body.get("clear", True)))
@@ -232,9 +242,38 @@ class Api:
         return self._platform.arm(_require(body, "train_id"), bool(body.get("armed", True)))
 
     def _position(self, params: dict, body: dict) -> dict:
+        seq = body.get("seq")
+        rtt = body.get("rtt_ms")
+        sent = body.get("sent_at")
         return self._platform.refresh_position(
-            _require(body, "train_id"), _as_int(body, "position_m", 0)
+            _require(body, "train_id"),
+            _as_int(body, "position_m", 0),
+            seq=int(seq) if seq is not None else None,
+            rtt_ms=float(rtt) if rtt is not None else None,
+            sent_at=float(sent) if sent is not None else None,
         )
+
+    def _link_sample(self, params: dict, body: dict) -> dict:
+        seq = body.get("seq")
+        rtt = body.get("rtt_ms")
+        sent = body.get("sent_at")
+        return self._platform.link_sample(
+            _require(body, "train_id"),
+            ok=bool(body.get("ok", True)),
+            seq=int(seq) if seq is not None else None,
+            rtt_ms=float(rtt) if rtt is not None else None,
+            sent_at=float(sent) if sent is not None else None,
+        )
+
+    def _link_train(self, params: dict, body: dict) -> dict:
+        train_id = str(params.get("trainID", ""))
+        view = self._platform.link_view(train_id)
+        if view is None:
+            raise RailError(f"列车没有链路会话: {train_id}", component="console")
+        return view
+
+    def _link_replay(self, params: dict, body: dict) -> dict:
+        return self._platform.replay_link(str(params.get("trainID", "")))
 
     def _sequence(self, params: dict, body: dict) -> dict:
         return self._platform.sequence_verdict(
